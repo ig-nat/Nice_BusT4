@@ -183,8 +183,10 @@ bool NiceBusT4::validate_message_() {                    // проверка п�
     // Проверка не проводится
     return true;
 
-  uint8_t crc1 = (data[3] ^ data[4] ^ data[5] ^ data[6] ^ data[7] ^ data[8]);
-
+  uint8_t crc1 = data[3];
+for (int i = 4; i <= 8; i++) {
+    crc1 ^= data[i];
+}
   // Byte 9: crc1 = XOR (Byte 3 : Byte 8) XOR шести предыдущих байт
   if (at == 9)
     if (data[9] != crc1) {
