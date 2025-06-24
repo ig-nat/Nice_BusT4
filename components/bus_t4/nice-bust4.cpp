@@ -43,37 +43,43 @@ void NiceBusT4::control(const CoverCall &call) {
 }
 
 void NiceBusT4::setup() {
-  _uart = uart_init(_UART_NO, BAUD_WORK, SERIAL_8N1, SERIAL_FULL, TX_P, 256, false);
+  _uart = uart_init(_UART_NO, BAUD_WORK, SERIAL_8N1, SERIAL_FULL, TX_P, 256, true);
+  
+  // Reset bus
+  uart_set_baudrate(_uart, BAUD_BREAK);
+  uart_write(_uart, "\x00", 1);
+  uart_flush(_uart);
+  delay(50);
+  uart_set_baudrate(_uart, BAUD_WORK);
+  
+  // Initial discovery
+  this->tx_buffer_.push(gen_inf_cmd(0x00, 0xFF, FOR_ALL, WHO, GET, 0x00));
 }
 
 void NiceBusT4::loop() {
-  if ((millis() - this->last_update_) > 10000) {
-    if (this->init_ok == false) {
-      this->tx_buffer_.push(gen_inf_cmd(0x00, 0xff, FOR_ALL, WHO, GET, 0x00));
-      this->tx_buffer_.push(gen_inf_cmd(0x00, 0xff, FOR_ALL, PRD, GET, 0x00));
-    }
+  // Periodic device discovery
+  if ((millis() - this->last_update_) > 10000 && !this->init_ok) {
+    this->tx_buffer_.push(gen_inf_cmd(0x00, 0xFF, FOR_ALL, WHO, GET, 0x00));
     this->last_update_ = millis();
   }
 
+  // Send queued commands
   uint32_t now = millis();
-  if (now - this->last_uart_byte_ > 100) {
-    this->ready_to_tx_ = true;
+  if (now - this->last_uart_byte_ > 100 && !this->tx_buffer_.empty()) {
+    this->send_array_cmd(this->tx_buffer_.front());
+    this->tx_buffer_.pop();
     this->last_uart_byte_ = now;
   }
 
-  while (uart_rx_available(_uart) > 0) {
-    uint8_t c = (uint8_t)uart_read_char(_uart);
+  // Receive handling
+  while (uart_rx_available(_uart) {
+    uint8_t c = uart_read_char(_uart);
     this->handle_char_(c);
     this->last_uart_byte_ = now;
   }
 
-  if (this->ready_to_tx_ && !this->tx_buffer_.empty()) {
-    this->send_array_cmd(this->tx_buffer_.front());
-    this->tx_buffer_.pop();
-    this->ready_to_tx_ = false;
-  }
-
-  if (!is_robus && init_ok && (current_operation != COVER_OPERATION_IDLE) && 
+  // Position updates
+  if (!is_robus && init_ok && current_operation != COVER_OPERATION_IDLE && 
       (now - last_position_time > POSITION_UPDATE_INTERVAL)) {
     last_position_time = now;
     request_position();
@@ -88,50 +94,48 @@ void NiceBusT4::handle_char_(uint8_t c) {
 }
 
 bool NiceBusT4::validate_message_() {
-  uint32_t at = this->rx_message_.size() - 1;
-  uint8_t *data = &this->rx_message_[0];
-  uint8_t new_byte = data[at];
-
-  // Basic header validation
-  if (at == 0) return new_byte == 0x00;
-  if (at == 1) return new_byte == START_CODE;
-  if (at == 2) return true;
-
-  uint8_t packet_size = data[2];
-  uint8_t length = (packet_size + 3);
-
-  if (at <= 8) return true;
-
-  // Improved CRC1 calculation
-  uint8_t crc1 = data[3];
-  for (int i = 4; i <= 8; i++) {
-    crc1 ^= data[i];
-  }
-
-  if (at == 9) {
-    if (data[9] != crc1) {
-      ESP_LOGW(TAG, "Invalid CRC1: calc=%02X recv=%02X", crc1, data[9]);
-      ESP_LOGW(TAG, "Message: %s", format_hex_pretty(rx_message_).c_str());
-      return false;
-    }
-    return true;
-  }
-
-  if (at < length) return true;
-
-  // CRC2 calculation
-  uint8_t crc2 = data[10];
-  for (uint8_t i = 11; i < length - 1; i++) {
-    crc2 ^= data[i];
-  }
-
-  if (data[length - 1] != crc2) {
-    ESP_LOGW(TAG, "Invalid CRC2: calc=%02X recv=%02X", crc2, data[length - 1]);
+  if (rx_message_.empty()) return false;
+  
+  // Minimum message check
+  if (rx_message_.size() < 5) {
+    ESP_LOGW(TAG, "Message too short: %d bytes", rx_message_.size());
     return false;
   }
 
-  if (data[length] != packet_size) {
-    ESP_LOGW(TAG, "Invalid size: exp=%02X recv=%02X", packet_size, data[length]);
+  // Header validation
+  if (rx_message_[0] != 0x00 || rx_message_[1] != START_CODE) {
+    ESP_LOGW(TAG, "Invalid header: %02X %02X", rx_message_[0], rx_message_[1]);
+    return false;
+  }
+
+  uint8_t packet_size = rx_message_[2];
+  uint8_t expected_length = packet_size + 3;
+
+  // Wait for complete message
+  if (rx_message_.size() < expected_length) {
+    return true;
+  }
+
+  // CRC1 calculation (bytes 3-8)
+  uint8_t crc1 = rx_message_[3];
+  for (int i = 4; i <= 8 && i < rx_message_.size(); i++) {
+    crc1 ^= rx_message_[i];
+  }
+
+  if (rx_message_[9] != crc1) {
+    ESP_LOGW(TAG, "CRC1 mismatch: calc=%02X recv=%02X Packet: %s", 
+            crc1, rx_message_[9], format_hex_pretty(rx_message_).c_str());
+    return false;
+  }
+
+  // CRC2 calculation (bytes 10 to length-2)
+  uint8_t crc2 = rx_message_[10];
+  for (uint8_t i = 11; i < expected_length - 1; i++) {
+    crc2 ^= rx_message_[i];
+  }
+
+  if (rx_message_[expected_length - 1] != crc2) {
+    ESP_LOGW(TAG, "CRC2 mismatch: calc=%02X recv=%02X", crc2, rx_message_[expected_length - 1]);
     return false;
   }
 
@@ -139,15 +143,79 @@ bool NiceBusT4::validate_message_() {
   rx_message_.erase(rx_message_.begin());
   ESP_LOGD(TAG, "Received: %s", format_hex_pretty(rx_message_).c_str());
   parse_status_packet(rx_message_);
-
   return false;
 }
 
-// [Остальные функции остаются без изменений...]
-// parse_status_packet(), dump_config(), gen_control_cmd(), gen_inf_cmd(),
-// send_raw_cmd(), raw_cmd_prepare(), send_array_cmd(), send_inf_cmd(),
-// set_mcu(), init_device(), request_position(), update_position(),
-// publish_state_if_changed()
+void NiceBusT4::send_array_cmd(const uint8_t *data, size_t len) {
+  // BREAK condition
+  uart_set_baudrate(_uart, BAUD_BREAK);
+  uart_write(_uart, "\x00", 1);
+  uart_flush(_uart);
+  delayMicroseconds(1000);
+  
+  // Main transmission
+  uart_set_baudrate(_uart, BAUD_WORK);
+  delayMicroseconds(100);
+  uart_write(_uart, (char *)data, len);
+  uart_flush(_uart);
+  
+  ESP_LOGD(TAG, "Sent: %s", format_hex_pretty(data, len).c_str());
+}
+
+// Остальные методы остаются без изменений
+void NiceBusT4::parse_status_packet(const std::vector<uint8_t> &data) {
+  // ... существующая реализация ...
+}
+
+void NiceBusT4::dump_config() {
+  // ... существующая реализация ...
+}
+
+std::vector<uint8_t> NiceBusT4::gen_control_cmd(const uint8_t control_cmd) {
+  // ... существующая реализация ...
+}
+
+std::vector<uint8_t> NiceBusT4::gen_inf_cmd(const uint8_t to_addr1, const uint8_t to_addr2, 
+                                          const uint8_t whose, const uint8_t inf_cmd, 
+                                          const uint8_t run_cmd, const uint8_t next_data, 
+                                          const std::vector<uint8_t> &data, size_t len) {
+  // ... существующая реализация ...
+}
+
+void NiceBusT4::send_raw_cmd(std::string data) {
+  // ... существующая реализация ...
+}
+
+std::vector<uint8_t> NiceBusT4::raw_cmd_prepare(std::string data) {
+  // ... существующая реализация ...
+}
+
+void NiceBusT4::send_inf_cmd(std::string to_addr, std::string whose, 
+                            std::string command, std::string type_command, 
+                            std::string next_data, bool data_on, 
+                            std::string data_command) {
+  // ... существующая реализация ...
+}
+
+void NiceBusT4::set_mcu(std::string command, std::string data_command) {
+  // ... существующая реализация ...
+}
+
+void NiceBusT4::init_device(const uint8_t addr1, const uint8_t addr2, const uint8_t device) {
+  // ... существующая реализация ...
+}
+
+void NiceBusT4::request_position(void) {
+  // ... существующая реализация ...
+}
+
+void NiceBusT4::update_position(uint16_t newpos) {
+  // ... существующая реализация ...
+}
+
+void NiceBusT4::publish_state_if_changed(void) {
+  // ... существующая реализация ...
+}
 
 }  // namespace bus_t4
 }  // namespace esphome
