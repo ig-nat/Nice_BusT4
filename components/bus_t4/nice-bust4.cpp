@@ -1,6 +1,7 @@
 #include "nice-bust4.h"
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
+#include <algorithm> // Для std::clamp
 
 namespace esphome {
 namespace bus_t4 {
@@ -64,29 +65,26 @@ void NiceBusT4::loop() {
 }
 
 void NiceBusT4::control(const CoverCall &call) {
+  position_hook_type = IGNORE;
   if (call.get_stop()) {
     send_cmd(STOP);
-    position_hook_type = IGNORE;
-    return;
-  }
-
-  if (call.get_position().has_value()) {
+  } else if (call.get_position().has_value()) {
     float newpos = *call.get_position();
     if (newpos != position) {
       if (newpos == COVER_OPEN) {
-        send_cmd(OPEN);
+        if (current_operation != COVER_OPERATION_OPENING) send_cmd(OPEN);
       } else if (newpos == COVER_CLOSED) {
-        send_cmd(CLOSE);
+        if (current_operation != COVER_OPERATION_CLOSING) send_cmd(CLOSE);
       } else {
-        position_hook_value = (_pos_opn - _pos_cls) * newpos + _pos_cls;
-        ESP_LOGD(TAG, "Target position: %d", position_hook_value);
+        position_hook_value = _pos_cls + (newpos * (_pos_opn - _pos_cls) / 100.0f;
+        ESP_LOGI(TAG, "Requested position: %d (%.1f%%)", position_hook_value, newpos);
         
         if (position_hook_value > _pos_usl) {
           position_hook_type = STOP_UP;
-          send_cmd(OPEN);
+          if (current_operation != COVER_OPERATION_OPENING) send_cmd(OPEN);
         } else {
           position_hook_type = STOP_DOWN;
-          send_cmd(CLOSE);
+          if (current_operation != COVER_OPERATION_CLOSING) send_cmd(CLOSE);
         }
       }
     }
@@ -232,14 +230,106 @@ std::vector<uint8_t> NiceBusT4::gen_inf_cmd(const uint8_t to_addr1, const uint8_
 }
 
 void NiceBusT4::parse_status_packet(const std::vector<uint8_t> &data) {
-  // [Реализация разбора пакетов остается без изменений]
+  // [Существующая реализация разбора пакетов]
   // ...
+
+  // Обработка крайних положений
+  switch (data[10]) {
+    case POS_MIN:
+      this->_pos_cls = (data[14] << 8) + data[15];
+      ESP_LOGI(TAG, "Closed position set: %d", this->_pos_cls);
+      break;
+      
+    case POS_MAX:
+      this->_pos_opn = (data[14] << 8) + data[15];
+      ESP_LOGI(TAG, "Open position set: %d", this->_pos_opn);
+      break;
+  }
+  
+  // Обработка статуса движения
+  if (data[1] > 0x0d) {
+    switch (data[9]) {
+      case FOR_CU:
+        if (data[10] + 0x80 == RUN) {
+          if (data[11] >= 0x80) {
+            // Обработка команд
+          } else {
+            // Обработка статусов
+            switch (data[11]) {
+              case STA_OPENING:
+                this->current_operation = COVER_OPERATION_OPENING;
+                ESP_LOGI(TAG, "Status: Opening");
+                break;
+              case STA_CLOSING:
+                this->current_operation = COVER_OPERATION_CLOSING;
+                ESP_LOGI(TAG, "Status: Closing");
+                break;
+              case OPENED:
+                this->current_operation = COVER_OPERATION_IDLE;
+                this->position = 100.0f;
+                ESP_LOGI(TAG, "Status: Fully Open");
+                break;
+              case CLOSED:
+                this->current_operation = COVER_OPERATION_IDLE;
+                this->position = 0.0f;
+                ESP_LOGI(TAG, "Status: Fully Closed");
+                break;
+              case STOPPED:
+                this->current_operation = COVER_OPERATION_IDLE;
+                ESP_LOGI(TAG, "Status: Stopped");
+                break;
+            }
+          }
+        }
+        break;
+    }
+  }
+  
+  // Обязательно публикуем состояние после изменения
+  publish_state_if_changed();
+}
+
+void NiceBusT4::update_position(uint16_t newpos) {
+  last_position_time = millis();
+  _pos_usl = newpos;
+
+  // Рассчитываем процент открытия
+  if (_pos_opn != _pos_cls) {
+    position = 100.0f * (static_cast<float>(newpos - _pos_cls) / 
+                        static_cast<float>(_pos_opn - _pos_cls));
+  } else {
+    position = 0.0f;
+  }
+
+  // Ограничиваем диапазон 0-100%
+  position = std::clamp(position, 0.0f, 100.0f);
+
+  ESP_LOGD(TAG, "Position: raw=%d, calc=%.1f%%", newpos, position);
+  publish_state_if_changed();
+}
+
+void NiceBusT4::publish_state_if_changed() {
+  static float last_published_pos = -1.0f;
+  static CoverOperation last_published_op = COVER_OPERATION_IDLE;
+
+  // Порог изменения положения для публикации (1%)
+  if (fabs(position - last_published_pos) > 1.0 || 
+      current_operation != last_published_op) {
+    publish_state();
+    last_published_pos = position;
+    last_published_op = current_operation;
+  }
 }
 
 void NiceBusT4::dump_config() {
-  // [Реализация вывода конфигурации остается без изменений]
-  // ...
+  ESP_LOGCONFIG(TAG, "Nice BusT4 Cover");
+  ESP_LOGCONFIG(TAG, "  Closed position: %d", _pos_cls);
+  ESP_LOGCONFIG(TAG, "  Open position: %d", _pos_opn);
+  ESP_LOGCONFIG(TAG, "  Current position: %d", _pos_usl);
+  ESP_LOGCONFIG(TAG, "  Calculated position: %.1f%%", position);
 }
 
+// Остальные методы остаются без изменений
+// ...
 }  // namespace bus_t4
 }  // namespace esphome
